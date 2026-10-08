@@ -10,16 +10,23 @@ press "Geotag" (or tick "auto-run" to geotag as soon as the uploads finish).
 
 Uploaded files land in <dir>/photos and <dir>/gpx. Only the Python standard
 library and the `exiftool` binary are required.
+
+Optionally pass --immich-url and --immich-key (or IMMICH_URL / IMMICH_API_KEY)
+to upload the geotagged photos to an Immich server.
 """
 
 import argparse
+import hashlib
 import html
+import http.client
 import json
 import os
 import re
 import shutil
 import subprocess
 import threading
+import uuid
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +44,7 @@ CHUNK = 1024 * 1024
 OFFSET_RE = re.compile(r"^[+-]?\d{1,2}(:\d{2}(:\d{2})?)?$")
 
 geotag_lock = threading.Lock()
+immich_lock = threading.Lock()
 
 
 def safe_name(name: str) -> str:
@@ -106,6 +114,133 @@ def run_geotag(photo_dir: Path, gpx_dir: Path, opts: dict) -> dict:
     }
 
 
+class ImmichError(Exception):
+    pass
+
+
+class Immich:
+    """Minimal Immich API client (stdlib only). `url` is the server root, e.g. http://localhost:2283."""
+
+    def __init__(self, url: str, key: str):
+        self.url = urlparse(url.rstrip("/"))
+        self.key = key
+        self._needs_device_ids = None
+
+    def _conn(self):
+        cls = http.client.HTTPSConnection if self.url.scheme == "https" else http.client.HTTPConnection
+        return cls(self.url.netloc, timeout=300)
+
+    def _path(self, path: str) -> str:
+        return f"{self.url.path}/api{path}"
+
+    def _finish(self, conn, method, path):
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        if resp.status >= 400:
+            raise ImmichError(f"{method} {path}: HTTP {resp.status} {data[:300].decode(errors='replace')}")
+        return resp.status, (json.loads(data) if data else None)
+
+    def request(self, method: str, path: str, payload=None):
+        body = json.dumps(payload).encode() if payload is not None else None
+        headers = {"x-api-key": self.key, "Accept": "application/json"}
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        conn = self._conn()
+        conn.request(method, self._path(path), body=body, headers=headers)
+        return self._finish(conn, method, path)[1]
+
+    def needs_device_ids(self) -> bool:
+        # Immich < 3 requires deviceAssetId/deviceId on uploads; v3 dropped them.
+        if self._needs_device_ids is None:
+            try:
+                self._needs_device_ids = self.request("GET", "/server/version")["major"] < 3
+            except Exception:
+                self._needs_device_ids = True
+        return self._needs_device_ids
+
+    def upload(self, path: Path) -> dict:
+        """Upload one file; returns {"id", "status": "created" | "duplicate"}."""
+        sha1 = hashlib.sha1()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(CHUNK), b""):
+                sha1.update(chunk)
+
+        st = path.stat()
+        mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat().replace("+00:00", "Z")
+        fields = {"fileCreatedAt": mtime, "fileModifiedAt": mtime}
+        if self.needs_device_ids():
+            fields["deviceAssetId"] = f"{path.name}-{st.st_size}-{sha1.hexdigest()[:12]}"
+            fields["deviceId"] = "geotag-server"
+
+        # Build the multipart body by hand so big RAW/video files are streamed, not loaded in RAM.
+        boundary = uuid.uuid4().hex
+        head = b"".join(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+            for k, v in fields.items()
+        )
+        head += (f'--{boundary}\r\nContent-Disposition: form-data; name="assetData"; '
+                 f'filename="{path.name}"\r\nContent-Type: application/octet-stream\r\n\r\n').encode()
+        tail = f"\r\n--{boundary}--\r\n".encode()
+
+        conn = self._conn()
+        conn.putrequest("POST", self._path("/assets"))
+        conn.putheader("x-api-key", self.key)
+        conn.putheader("Accept", "application/json")
+        conn.putheader("x-immich-checksum", sha1.hexdigest())  # lets Immich skip known files
+        conn.putheader("Content-Type", f"multipart/form-data; boundary={boundary}")
+        conn.putheader("Content-Length", str(len(head) + st.st_size + len(tail)))
+        conn.endheaders()
+        conn.send(head)
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(CHUNK), b""):
+                conn.send(chunk)
+        conn.send(tail)
+        return self._finish(conn, "POST", "/assets")[1]
+
+    def add_to_album(self, name: str, asset_ids: list) -> str:
+        albums = self.request("GET", "/albums") or []
+        album = next((a for a in albums if a.get("albumName") == name), None)
+        if album is None:
+            self.request("POST", "/albums", {"albumName": name, "assetIds": asset_ids})
+            return f"created album '{name}' with {len(asset_ids)} photo(s)"
+        self.request("PUT", f"/albums/{album['id']}/assets", {"ids": asset_ids})
+        return f"added {len(asset_ids)} photo(s) to album '{name}'"
+
+
+def run_immich_upload(immich: Immich, photo_dir: Path, opts: dict) -> dict:
+    photos = list_files(photo_dir)
+    if not photos:
+        return {"ok": False, "output": "No photos to upload."}
+    if not immich_lock.acquire(blocking=False):
+        return {"ok": False, "output": "An Immich upload is already in progress."}
+
+    lines, ids, created, failed = [], [], 0, 0
+    try:
+        for n in photos:
+            try:
+                r = immich.upload(photo_dir / n)
+                ids.append(r["id"])
+                created += r["status"] == "created"
+                lines.append(f"{r['status']:>9}  {n}")
+            except Exception as e:
+                failed += 1
+                lines.append(f"   FAILED  {n}: {e}")
+
+        album = (opts.get("album") or "").strip()
+        if album and ids:
+            try:
+                lines.append("\n" + immich.add_to_album(album, ids))
+            except Exception as e:
+                failed += 1
+                lines.append(f"\nalbum FAILED: {e}")
+    finally:
+        immich_lock.release()
+
+    summary = f"Immich: {created} uploaded, {len(ids) - created} already there, {failed} failed"
+    return {"ok": failed == 0, "output": summary + "\n\n" + "\n".join(lines)}
+
+
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -150,8 +285,14 @@ PAGE = """<!doctype html>
   <label class="inline"><input id="overwrite" type="checkbox" checked>&nbsp;overwrite originals (no _original backups)</label>
   <label class="inline"><input id="auto" type="checkbox" checked>&nbsp;auto-run after upload</label>
 </div>
+<div class="row immich" hidden>
+  <label>Immich album (optional)
+    <input id="album" type="text" placeholder="no album"></label>
+  <label class="inline"><input id="autoImmich" type="checkbox" checked>&nbsp;upload to Immich after geotagging</label>
+</div>
 <div class="row">
   <button id="run">Geotag photos</button>
+  <button id="immich" class="immich" hidden>Upload to Immich</button>
   <button id="clear" class="secondary">Delete all uploads</button>
 </div>
 
@@ -160,7 +301,7 @@ PAGE = """<!doctype html>
   <div><h3>GPX tracks (<span id="ng">0</span>)</h3><ul id="gpx"></ul></div>
 </div>
 
-<h3>exiftool output</h3>
+<h3>Output</h3>
 <pre id="out">(nothing yet)</pre>
 
 <script>
@@ -182,7 +323,10 @@ async function refresh() {
   const r = await fetch('/files'); const d = await r.json();
   fill($('photos'), d.photos); fill($('gpx'), d.gpx);
   $('np').textContent = d.photos.length; $('ng').textContent = d.gpx.length;
+  document.querySelectorAll('.immich').forEach(el => el.hidden = !d.immich);
+  immichEnabled = d.immich;
 }
+let immichEnabled = false;
 
 function sendOne(file, onProgress) {
   return new Promise((resolve, reject) => {
@@ -220,11 +364,25 @@ async function geotag() {
       body: JSON.stringify({ timezone: $('timezone').value, geosync: $('geosync').value,
                              overwrite: $('overwrite').checked }) });
     const d = await r.json(); $('out').textContent = d.output;
+    if (d.ok && immichEnabled && $('autoImmich').checked) {
+      $('run').disabled = false; return toImmich(d.output + '\\n\\n');
+    }
   } catch (e) { $('out').textContent = 'Error: ' + e.message; }
   $('run').disabled = false; refresh();
 }
 
+async function toImmich(prefix = '') {
+  $('immich').disabled = true; $('out').textContent = prefix + 'Uploading to Immich…';
+  try {
+    const r = await fetch('/immich', { method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ album: $('album').value }) });
+    const d = await r.json(); $('out').textContent = prefix + d.output;
+  } catch (e) { $('out').textContent = prefix + 'Error: ' + e.message; }
+  $('immich').disabled = false;
+}
+
 $('run').onclick = geotag;
+$('immich').onclick = () => toImmich();
 $('clear').onclick = async () => {
   if (!confirm('Delete all uploaded photos and GPX files on the server?')) return;
   await fetch('/clear', { method: 'POST' }); refresh(); $('out').textContent = '(cleared)';
@@ -270,7 +428,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, PAGE.replace("__EXTS__", html.escape(exts)).encode(),
                        "text/html; charset=utf-8")
         elif path == "/files":
-            self._json({"photos": list_files(self.photo_dir), "gpx": list_files(self.gpx_dir)})
+            self._json({"photos": list_files(self.photo_dir), "gpx": list_files(self.gpx_dir),
+                        "immich": self.server.immich is not None})
         else:
             self._send(HTTPStatus.NOT_FOUND, b"not found")
 
@@ -284,6 +443,16 @@ class Handler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 opts = {}
             result = run_geotag(self.photo_dir, self.gpx_dir, opts)
+            print(result["output"], flush=True)
+            self._json(result)
+        elif url.path == "/immich":
+            try:
+                opts = json.loads(self._read_body() or b"{}")
+            except json.JSONDecodeError:
+                opts = {}
+            if self.server.immich is None:
+                return self._json({"ok": False, "output": "Immich is not configured."})
+            result = run_immich_upload(self.server.immich, self.photo_dir, opts)
             print(result["output"], flush=True)
             self._json(result)
         elif url.path == "/clear":
@@ -337,7 +506,22 @@ def main():
     ap.add_argument("--host", default="0.0.0.0", help="interface to bind (default: all)")
     ap.add_argument("--port", type=int, default=8000, help="port to listen on (default: 8000)")
     ap.add_argument("--dir", default="uploads", help="where uploads are stored (default: ./uploads)")
+    ap.add_argument("--immich-url", default=os.environ.get("IMMICH_URL"),
+                    help="Immich server, e.g. http://localhost:2283 (env: IMMICH_URL)")
+    ap.add_argument("--immich-key", default=os.environ.get("IMMICH_API_KEY"),
+                    help="Immich API key (env: IMMICH_API_KEY; prefer the env var over the flag)")
     args = ap.parse_args()
+
+    immich = None
+    if args.immich_url and args.immich_key:
+        immich = Immich(args.immich_url, args.immich_key)
+        try:
+            me = immich.request("GET", "/users/me")
+            print(f"Immich: uploading as {me.get('email')} to {args.immich_url}")
+        except Exception as e:
+            print(f"WARNING: could not reach Immich ({e}); uploads to it will fail.")
+    elif args.immich_url or args.immich_key:
+        ap.error("--immich-url and --immich-key must be given together")
 
     if shutil.which("exiftool") is None:
         print("WARNING: exiftool not found on PATH; uploads work but geotagging will fail.")
@@ -348,6 +532,7 @@ def main():
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.upload_dir = upload_dir
+    httpd.immich = immich
     print(f"Serving on http://{args.host}:{args.port}/  (files -> {upload_dir})")
     try:
         httpd.serve_forever()
