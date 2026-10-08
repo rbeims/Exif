@@ -285,6 +285,11 @@ class InboxWatcher:
             self.state = json.loads(self.state_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             self.state = {"files": {}, "gpx_sig": []}
+        if "album_pending" not in self.state:
+            # State from before album retries existed: (re)add everything already uploaded.
+            # Adding a photo that is already in the album is harmless.
+            self.state["album_pending"] = [v["immich_id"] for v in self.state["files"].values()
+                                           if v.get("immich_id")]
         self.log = collections.deque(maxlen=300)
         self.wake = threading.Event()
         self.busy = False
@@ -409,14 +414,15 @@ class InboxWatcher:
 
         # 5. deliver: upload to Immich, or just move into done/
         ready = [r for r, v in files.items() if v["status"] == "ready"]
-        uploaded = []
+        pending_album = self.state.setdefault("album_pending", [])
         for rel in ready:
             src = self.work / rel
             try:
                 if self.immich:
                     r = self.immich.upload(src)
                     files[rel].update(immich_id=r["id"])
-                    uploaded.append(r["id"])
+                    if self.album:
+                        pending_album.append(r["id"])
                     src.unlink(missing_ok=True)  # original stays in the mirror, tagged copy in Immich
                     self._log(f"Immich {r['status']}: {rel} ({files[rel].get('note', '')})")
                 else:
@@ -428,11 +434,15 @@ class InboxWatcher:
             except Exception as e:
                 self._log(f"upload failed, will retry: {rel}: {e}")
             self._save()
-        if uploaded and self.album:
+        # Album additions are remembered in state.json and retried every cycle (and after a
+        # restart) until they succeed, e.g. once the API key has the album permissions.
+        if pending_album and self.album and self.immich:
             try:
-                self._log(self.immich.add_to_album(self.album, uploaded))
+                self._log(self.immich.add_to_album(self.album, pending_album))
+                pending_album.clear()
             except Exception as e:
-                self._log(f"album update failed: {e}")
+                self._log(f"album update failed, will retry next sync: {e}")
+            self._save()
 
         self.busy = False
         self.summary = self._summarize()
