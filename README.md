@@ -66,6 +66,11 @@ deleted from Drive, so Drive doubles as a backup of the untouched originals.
    authenticate?" (the server has no browser).
 3. rclone prints an `rclone authorize "drive" ...` command: run it on any computer with a
    browser and rclone installed, log in, and paste the token it prints back into the server.
+   **Only have an iPad?** Use an SSH tunnel instead: connect with an SSH app that supports
+   port forwarding (Blink, Termius, …) using `ssh -L 53682:localhost:53682 user@server`, run
+   `rclone config` there, answer **y** to the browser question and open the
+   `http://127.0.0.1:53682/auth?...` link it prints in Safari. Keep the SSH app visible in
+   Split View while you log in so iOS doesn't suspend the tunnel.
 4. Create the folder `GeotagInbox` in Drive and check: `rclone lsf gdrive:GeotagInbox`.
 
 ### Run
