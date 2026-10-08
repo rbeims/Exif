@@ -12,10 +12,13 @@ Uploaded files land in <dir>/photos and <dir>/gpx. Only the Python standard
 library and the `exiftool` binary are required.
 
 Optionally pass --immich-url and --immich-key (or IMMICH_URL / IMMICH_API_KEY)
-to upload the geotagged photos to an Immich server.
+to upload the geotagged photos to an Immich server, and --inbox-source
+(e.g. gdrive:GeotagInbox) to pull photos + GPX from Google Drive via rclone and
+process them automatically. See README.md.
 """
 
 import argparse
+import collections
 import hashlib
 import html
 import http.client
@@ -25,6 +28,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -38,6 +42,7 @@ PHOTO_EXTS = {
     ".mp4", ".mov",
 }
 TRACK_EXTS = {".gpx"}
+VIDEO_EXTS = {".mp4", ".mov"}
 CHUNK = 1024 * 1024
 
 # Offsets like "+02:00", "-5:30", "0" for -geosync / timezone fields.
@@ -72,7 +77,10 @@ def run_geotag(photo_dir: Path, gpx_dir: Path, opts: dict) -> dict:
         return {"ok": False, "output": "No GPX files uploaded yet."}
     if not photos:
         return {"ok": False, "output": "No photos uploaded yet."}
+    return geotag_files([photo_dir / n for n in photos], gpx_files, opts)
 
+
+def geotag_files(photos: list, gpx_files: list, opts: dict, wait: bool = False) -> dict:
     cmd = ["exiftool", "-P"]  # -P: preserve file modification date
     for g in gpx_files:
         cmd += ["-geotag", str(g)]
@@ -95,10 +103,10 @@ def run_geotag(photo_dir: Path, gpx_dir: Path, opts: dict) -> dict:
     if opts.get("overwrite", True):
         cmd.append("-overwrite_original")
 
-    cmd += [str(photo_dir / n) for n in photos]
+    cmd += [str(p) for p in photos]
 
     # Never let two geotag runs touch the same files at once.
-    if not geotag_lock.acquire(blocking=False):
+    if not geotag_lock.acquire(blocking=wait):
         return {"ok": False, "output": "A geotag run is already in progress."}
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -112,6 +120,19 @@ def run_geotag(photo_dir: Path, gpx_dir: Path, opts: dict) -> dict:
         "ok": proc.returncode == 0,
         "output": f"$ {printable}\n\n{proc.stdout}{proc.stderr}",
     }
+
+
+def files_with_gps(files: list) -> set:
+    """Return the subset of `files` (as str paths) that carry a GPS position."""
+    if not files:
+        return set()
+    try:
+        proc = subprocess.run(["exiftool", "-json", "-n", "-GPSLatitude", *map(str, files)],
+                              capture_output=True, text=True)
+        data = json.loads(proc.stdout or "[]")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+    return {d["SourceFile"] for d in data if "GPSLatitude" in d}
 
 
 class ImmichError(Exception):
@@ -241,6 +262,182 @@ def run_immich_upload(immich: Immich, photo_dir: Path, opts: dict) -> dict:
     return {"ok": failed == 0, "output": summary + "\n\n" + "\n".join(lines)}
 
 
+class InboxWatcher:
+    """
+    Polls an inbox folder (optionally filled from Google Drive etc. with `rclone copy`),
+    geotags new photos with every GPX track found in the inbox and uploads them to Immich.
+
+    The inbox mirror is never modified: each new file is copied to a work folder first.
+    Per-file state (new -> waiting -> ready -> done) lives in state.json, so files that stay
+    in the inbox are processed only once. Photos that no track covers yet stay "waiting"
+    and are retried whenever the set of GPX files changes.
+    """
+
+    def __init__(self, base: Path, mirror: Path, rclone_source, interval: int, opts: dict,
+                 album: str, untagged_after_h: float, immich):
+        self.mirror, self.rclone_source, self.interval = mirror, rclone_source, interval
+        self.opts, self.album, self.untagged_after_h, self.immich = opts, album, untagged_after_h, immich
+        self.work, self.done = base / "work", base / "done"
+        self.state_path = base / "state.json"
+        for d in (self.mirror, self.work, self.done):
+            d.mkdir(parents=True, exist_ok=True)
+        try:
+            self.state = json.loads(self.state_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.state = {"files": {}, "gpx_sig": []}
+        self.log = collections.deque(maxlen=300)
+        self.wake = threading.Event()
+        self.busy = False
+        self.last_sync = None
+        self.summary = self._summarize()
+
+    # --- public --------------------------------------------------------------
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True, name="inbox-watcher").start()
+
+    def sync_now(self):
+        self.wake.set()
+
+    # --- internals -----------------------------------------------------------
+    def _log(self, msg: str):
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {msg}"
+        self.log.append(line)
+        print(f"[inbox] {line}", flush=True)
+
+    def _loop(self):
+        while True:
+            try:
+                self.cycle()
+            except Exception as e:  # keep the watcher alive whatever happens
+                self._log(f"ERROR: {e!r}")
+                self.busy = False
+            self.wake.wait(self.interval)
+            self.wake.clear()
+
+    def _save(self):
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.state, indent=1))
+        os.replace(tmp, self.state_path)
+
+    def _summarize(self) -> dict:
+        files = self.state["files"]
+        by = lambda st: sorted(k for k, v in files.items() if v["status"] == st)
+        return {
+            "enabled": True, "busy": self.busy, "source": self.rclone_source or str(self.mirror),
+            "interval": self.interval, "last_sync": self.last_sync,
+            "gpx": [g[0] for g in self.state.get("gpx_sig", [])],
+            "waiting": by("waiting"), "ready": by("ready"), "done": len(by("done")),
+            "log": list(self.log)[-60:],
+        }
+
+    def _scan(self):
+        media, gpx = [], []
+        for p in sorted(self.mirror.rglob("*")):
+            rel = p.relative_to(self.mirror)
+            if not p.is_file() or any(part.startswith(".") for part in rel.parts) \
+                    or p.name.endswith((".partial", "_original")):
+                continue
+            ext = p.suffix.lower()
+            if ext in TRACK_EXTS:
+                gpx.append(p)
+            elif ext in PHOTO_EXTS:
+                media.append(p)
+        return media, gpx
+
+    def cycle(self):
+        self.busy = True
+        self.summary = self._summarize()
+        files = self.state["files"]
+
+        if self.rclone_source:
+            proc = subprocess.run(["rclone", "copy", self.rclone_source, str(self.mirror)],
+                                  capture_output=True, text=True)
+            if proc.returncode != 0:
+                self._log(f"rclone copy failed ({proc.returncode}): {(proc.stderr or proc.stdout).strip()[-500:]}")
+        self.last_sync = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 1. pick up new (or replaced) files: copy them out of the mirror into the work folder
+        media, gpx = self._scan()
+        new = []
+        for p in media:
+            rel, size = str(p.relative_to(self.mirror)), p.stat().st_size
+            if rel in files and files[rel]["size"] == size:
+                continue
+            dest = self.work / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(p, dest)
+            files[rel] = {"size": size, "status": "new", "since": time.time()}
+            new.append(rel)
+        if new:
+            self._log(f"{len(new)} new file(s): {', '.join(new[:10])}{' …' if len(new) > 10 else ''}")
+
+        # 2. videos go straight through; photos that already have GPS (e.g. phone pictures) too
+        new_photos = []
+        for rel in new:
+            if Path(rel).suffix.lower() in VIDEO_EXTS:
+                files[rel].update(status="ready", note="video, not geotagged")
+            else:
+                new_photos.append(rel)
+        has_gps = files_with_gps([self.work / r for r in new_photos])
+        for rel in new_photos:
+            if str(self.work / rel) in has_gps:
+                files[rel].update(status="ready", note="already had GPS")
+            else:
+                files[rel]["status"] = "waiting"
+
+        # 3. geotag waiting photos when there is something new to try
+        gpx_sig = [[str(g.relative_to(self.mirror)), g.stat().st_size] for g in gpx]
+        waiting = [r for r, v in files.items() if v["status"] == "waiting"]
+        if waiting and gpx and (new_photos or gpx_sig != self.state.get("gpx_sig")):
+            self._log(f"geotagging {len(waiting)} photo(s) with {len(gpx)} GPX file(s)")
+            res = geotag_files([self.work / r for r in waiting], gpx, self.opts, wait=True)
+            tail = [l for l in res["output"].splitlines() if l.strip() and not l.startswith("$")]
+            for l in tail[-5:]:
+                self._log("  exiftool: " + l.strip())
+            tagged = files_with_gps([self.work / r for r in waiting])
+            for rel in waiting:
+                if str(self.work / rel) in tagged:
+                    files[rel].update(status="ready", note="geotagged")
+        self.state["gpx_sig"] = gpx_sig
+
+        # 4. optionally give up on photos no track ever covered
+        if self.untagged_after_h > 0:
+            for rel, v in files.items():
+                if v["status"] == "waiting" and time.time() - v["since"] > self.untagged_after_h * 3600:
+                    v.update(status="ready", note="no GPS, gave up waiting for a track")
+        self._save()
+
+        # 5. deliver: upload to Immich, or just move into done/
+        ready = [r for r, v in files.items() if v["status"] == "ready"]
+        uploaded = []
+        for rel in ready:
+            src = self.work / rel
+            try:
+                if self.immich:
+                    r = self.immich.upload(src)
+                    files[rel].update(immich_id=r["id"])
+                    uploaded.append(r["id"])
+                    src.unlink(missing_ok=True)  # original stays in the mirror, tagged copy in Immich
+                    self._log(f"Immich {r['status']}: {rel} ({files[rel].get('note', '')})")
+                else:
+                    dest = self.done / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(src, dest)
+                    self._log(f"done: {rel} ({files[rel].get('note', '')})")
+                files[rel]["status"] = "done"
+            except Exception as e:
+                self._log(f"upload failed, will retry: {rel}: {e}")
+            self._save()
+        if uploaded and self.album:
+            try:
+                self._log(self.immich.add_to_album(self.album, uploaded))
+            except Exception as e:
+                self._log(f"album update failed: {e}")
+
+        self.busy = False
+        self.summary = self._summarize()
+
+
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -300,6 +497,17 @@ PAGE = """<!doctype html>
   <div><h3>Photos (<span id="np">0</span>)</h3><ul id="photos"></ul></div>
   <div><h3>GPX tracks (<span id="ng">0</span>)</h3><ul id="gpx"></ul></div>
 </div>
+
+<section id="inbox" hidden>
+  <h3>Drive inbox <button id="syncNow" class="secondary">Sync now</button></h3>
+  <p class="muted" id="inboxInfo"></p>
+  <div class="cols">
+    <div><h4>Waiting for a GPX track (<span id="nw">0</span>)</h4><ul id="waiting"></ul></div>
+    <div><h4>GPX tracks in inbox (<span id="nig">0</span>)</h4><ul id="inboxGpx"></ul></div>
+  </div>
+  <h4>Inbox log</h4>
+  <pre id="inboxLog"></pre>
+</section>
 
 <h3>Output</h3>
 <pre id="out">(nothing yet)</pre>
@@ -381,6 +589,21 @@ async function toImmich(prefix = '') {
   $('immich').disabled = false;
 }
 
+async function refreshInbox() {
+  let d;
+  try { d = await (await fetch('/inbox')).json(); } catch (e) { return; }
+  $('inbox').hidden = !d.enabled;
+  if (!d.enabled) return;
+  $('inboxInfo').textContent = `Source: ${d.source} · every ${d.interval}s · last sync: ${d.last_sync || 'never'}` +
+    ` · ${d.busy ? 'working…' : 'idle'} · ${d.done} done, ${d.ready.length} to upload`;
+  fill($('waiting'), d.waiting); $('nw').textContent = d.waiting.length;
+  fill($('inboxGpx'), d.gpx); $('nig').textContent = d.gpx.length;
+  $('inboxLog').textContent = d.log.slice().reverse().join('\\n') || '(nothing yet)';
+  setTimeout(refreshInbox, d.busy ? 3000 : 15000);
+}
+$('syncNow').onclick = async () => { await fetch('/inbox/sync', { method: 'POST' }); setTimeout(refreshInbox, 1000); };
+refreshInbox();
+
 $('run').onclick = geotag;
 $('immich').onclick = () => toImmich();
 $('clear').onclick = async () => {
@@ -427,6 +650,9 @@ class Handler(BaseHTTPRequestHandler):
             exts = ", ".join(sorted(PHOTO_EXTS | TRACK_EXTS))
             self._send(HTTPStatus.OK, PAGE.replace("__EXTS__", html.escape(exts)).encode(),
                        "text/html; charset=utf-8")
+        elif path == "/inbox":
+            w = self.server.watcher
+            self._json(w.summary if w else {"enabled": False})
         elif path == "/files":
             self._json({"photos": list_files(self.photo_dir), "gpx": list_files(self.gpx_dir),
                         "immich": self.server.immich is not None})
@@ -455,6 +681,11 @@ class Handler(BaseHTTPRequestHandler):
             result = run_immich_upload(self.server.immich, self.photo_dir, opts)
             print(result["output"], flush=True)
             self._json(result)
+        elif url.path == "/inbox/sync":
+            self._read_body()
+            if self.server.watcher:
+                self.server.watcher.sync_now()
+            self._json({"ok": self.server.watcher is not None})
         elif url.path == "/clear":
             self._read_body()
             for d in (self.photo_dir, self.gpx_dir):
@@ -510,7 +741,25 @@ def main():
                     help="Immich server, e.g. http://localhost:2283 (env: IMMICH_URL)")
     ap.add_argument("--immich-key", default=os.environ.get("IMMICH_API_KEY"),
                     help="Immich API key (env: IMMICH_API_KEY; prefer the env var over the flag)")
+    inbox = ap.add_argument_group("inbox watcher (e.g. a Google Drive folder via rclone)")
+    inbox.add_argument("--inbox-source", metavar="REMOTE:PATH",
+                       help="rclone source copied into the inbox every interval, e.g. gdrive:GeotagInbox")
+    inbox.add_argument("--inbox-dir", metavar="DIR",
+                       help="local inbox folder to watch (default: <dir>/inbox/mirror)")
+    inbox.add_argument("--interval", type=int, default=300, help="seconds between inbox checks (default: 300)")
+    inbox.add_argument("--timezone", default="", help="camera timezone for inbox photos, e.g. +02:00")
+    inbox.add_argument("--geosync", default="", help="camera clock correction for inbox photos, e.g. +0:01:30")
+    inbox.add_argument("--album", default="", help="Immich album for inbox photos")
+    inbox.add_argument("--upload-untagged-after", type=float, default=0, metavar="HOURS",
+                       help="upload photos without GPS after waiting this long for a track (default: never)")
     args = ap.parse_args()
+
+    for name in ("timezone", "geosync"):
+        v = getattr(args, name)
+        if v and not OFFSET_RE.match(v):
+            ap.error(f"invalid --{name}: {v!r}")
+    if args.inbox_source and shutil.which("rclone") is None:
+        ap.error("--inbox-source needs rclone on PATH")
 
     immich = None
     if args.immich_url and args.immich_key:
@@ -533,6 +782,17 @@ def main():
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.upload_dir = upload_dir
     httpd.immich = immich
+    httpd.watcher = None
+    if args.inbox_source or args.inbox_dir:
+        base = upload_dir / "inbox"
+        mirror = Path(args.inbox_dir).resolve() if args.inbox_dir else base / "mirror"
+        httpd.watcher = InboxWatcher(
+            base, mirror, args.inbox_source, args.interval,
+            {"timezone": args.timezone, "geosync": args.geosync, "overwrite": True},
+            args.album, args.upload_untagged_after, immich)
+        httpd.watcher.start()
+        print(f"Inbox: watching {mirror}" + (f" (copied from {args.inbox_source})" if args.inbox_source else "")
+              + ("" if immich else "; Immich not configured, tagged photos go to inbox/done"))
     print(f"Serving on http://{args.host}:{args.port}/  (files -> {upload_dir})")
     try:
         httpd.serve_forever()
